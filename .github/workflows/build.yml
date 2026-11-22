@@ -5,7 +5,7 @@ on:
   
 jobs:
   build:
-    runs-on: windows-2022 # windows-latest ships MSVC 14.52, which needs Clang 22 and breaks LeviLamina
+    runs-on: windows-latest # with LLVM 22, the same setup LeviLamina builds itself with
     strategy:
       matrix:
         target_type:
