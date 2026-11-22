@@ -308,7 +308,7 @@ static bool vibrantSupportedDetour(void const* self) {
 // caller is logged with its address in hex and decimal; "vv <decimal>" in trigger.txt makes that caller see
 // "not split", "vvc <decimal>" makes it see one screen, and 0 clears the list.
 static std::mutex          gVvLock;
-static std::set<uintptr_t> gVvSites;
+static std::set<uintptr_t> gVvSites = {0x206A115, 0x210BF3B}; // Video settings checks in game 1.26.60.05
 static std::set<uintptr_t> gVvCountSites;
 
 static bool splitActiveDetour(void const* self) {
@@ -347,6 +347,39 @@ static void hookSplitQueries(IClientInstance& client, IMinecraftGame& game) {
                "game getSplitScreenCount");
 }
 
+// The third part of isVibrantVisualsEnabledAndSupported asks a global service (its ServiceLocator slot is at this
+// address in game 1.26.60.05) through vtable slot 0x230, and that answer turns false in split screen. Hook the function
+// behind the slot to log its answers; while gForceService is set ("vvsvc 0" / "vvsvc 1") it answers yes.
+static constexpr uintptr_t kVvServiceSlot = 0x128C3048;
+static std::atomic_bool    gForceService  = true;
+
+static bool vvServiceDetour(void* self) {
+    bool orig = reinterpret_cast<bool (*)(void*)>(gCfg["vvService"].origin)(self);
+    bool res  = orig || gForceService;
+    auto rva  = callerRva(_ReturnAddress());
+    std::lock_guard                              lock(gVvLock);
+    static std::set<std::pair<uintptr_t, bool>> seen; // logged again when a caller's answer changes
+    if (seen.insert({rva, orig}).second)
+        note("vv service check called from {:X} ({}): game said {}, returning {}", rva, rva, orig, res);
+    return res;
+}
+
+static void hookVvService() {
+    auto mod   = gameBase();
+    auto nt    = reinterpret_cast<IMAGE_NT_HEADERS const*>(mod + reinterpret_cast<IMAGE_DOS_HEADER const*>(mod)->e_lfanew);
+    auto end   = mod + nt->OptionalHeader.SizeOfImage;
+    auto svc   = *reinterpret_cast<void* const*>(mod + kVvServiceSlot);
+    if (!svc) return note("vv service: slot is empty");
+    auto vt = *reinterpret_cast<uintptr_t const* const*>(svc);
+    if (reinterpret_cast<uintptr_t>(vt) < mod || reinterpret_cast<uintptr_t>(vt) >= end)
+        return note("vv service: vtable outside the game, not hooking");
+    auto target = vt[0x230 / 8];
+    if (target < mod || target >= end) return note("vv service: slot 0x230 outside the game, not hooking");
+    ll::memory::hook(reinterpret_cast<ll::memory::FuncPtr>(target), fn(&vvServiceDetour), &gCfg["vvService"].origin,
+                     ll::memory::HookPriority::Normal);
+    note("Hooked vv service check inline at rva {:X} (vtable rva {:X})", target - mod, reinterpret_cast<uintptr_t>(vt) - mod);
+}
+
 static void hookVibrant(IOptionRegistry& options) {
     hookSlot(&options, &IOptionRegistry::setForceVibrantVisualsDisabled, fn(&setForceVibrantDetour),
              "setForceVibrantVisualsDisabled");
@@ -377,6 +410,7 @@ static void runTrigger(std::string const& cmd, int arg) {
     auto& game = client->getMinecraftGame();
     if (cmd == "pads") dumpPlayers(game); // the same as F9
     if (cmd == "vvkeep") note("keep Vibrant Visuals in split screen: {}", gKeepVibrant = arg != 0);
+    if (cmd == "vvsvc") note("vv service check forced to yes: {}", gForceService = arg != 0);
     if (cmd == "vv") {
         std::lock_guard lock(gVvLock);
         if (arg) gVvSites.insert(uintptr_t(arg));
@@ -1837,6 +1871,7 @@ bool MyMod::enable() {
              "addSubClientInstanceAndAssociateToUser");
     hookVibrant(client->getOptions());
     hookSplitQueries(*client.as_ptr(), game);
+    hookVvService();
     ll::thread::ClientThreadExecutor::getDefault().execute(pollTrigger);
     note("SplitScreenMod enabled ({} hooks)", gHooks.size());
     return true;
