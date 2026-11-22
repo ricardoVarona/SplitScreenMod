@@ -272,129 +272,20 @@ static ll::memory::FuncPtr* hookSlot(void* object, F method, ll::memory::FuncPtr
     return slot;
 }
 
-static auto fn(auto f) { return reinterpret_cast<ll::memory::FuncPtr>(f); }
-// Vibrant Visuals in split screen (experiment). The game turns Vibrant Visuals off once a second local player joins.
-// These hooks log what the game asks the options for, and while gKeepVibrant is set they keep it on: a request to
-// force it off is turned into "off = false", and "enabled and supported" stays true if it was true with one player.
-// "vvkeep 0" / "vvkeep 1" in trigger.txt turns this off / on while the game runs.
-static std::atomic_bool gKeepVibrant  = true;
-static std::atomic_int  gLocalPlayers = 1;     // refreshed on the client thread
-static std::atomic_bool gVibrantSolo  = false; // what the game said while only one player was in
-
-static uintptr_t callerRva(void* ret) { return reinterpret_cast<uintptr_t>(ret) - gameBase(); }
-
-static void setForceVibrantDetour(void* self, bool value) {
-    auto orig = reinterpret_cast<void (*)(void*, bool)>(gCfg["setForceVibrantVisualsDisabled"].origin);
-    bool pass = value && !gKeepVibrant;
-    note("setForceVibrantVisualsDisabled({}) from {:X} with {} players: passing {}", value, callerRva(_ReturnAddress()),
-         gLocalPlayers.load(), pass);
-    orig(self, pass);
-}
-
-static bool vibrantSupportedDetour(void const* self) {
-    auto orig = reinterpret_cast<bool (*)(void const*)>(gCfg["isVibrantVisualsEnabledAndSupported"].origin);
-    bool said = orig(self);
-    int  players = gLocalPlayers.load();
-    if (players <= 1) gVibrantSolo = said;
-    bool res = said || (gKeepVibrant && players > 1 && gVibrantSolo);
-    static std::atomic_int last = -1; // log only when the answer changes
-    if (last.exchange(int(said) * 2 + int(res)) != int(said) * 2 + int(res))
-        note("isVibrantVisualsEnabledAndSupported from {:X} with {} players: game said {}, returning {}",
-             callerRva(_ReturnAddress()), players, said, res);
-    return res;
-}
-
-// Which callers of the split screen checks turn Vibrant Visuals off (ported from the exp/vv experiment). Every new
-// caller is logged with its address in hex and decimal; "vv <decimal>" in trigger.txt makes that caller see
-// "not split", "vvc <decimal>" makes it see one screen, and 0 clears the list.
-static std::mutex          gVvLock;
-static std::set<uintptr_t> gVvSites = {0x206A115, 0x210BF3B}; // Video settings checks in game 1.26.60.05
-static std::set<uintptr_t> gVvCountSites;
-
-static bool splitActiveDetour(void const* self) {
-    auto orig = reinterpret_cast<bool (*)(void const*)>(gCfg["isSplitScreenActive"].origin)(self);
-    auto rva  = callerRva(_ReturnAddress());
-    std::lock_guard            lock(gVvLock);
-    static std::set<uintptr_t> seen;
-    if (seen.insert(rva).second) note("isSplitScreenActive called from {:X} ({}): game said {}", rva, rva, orig);
-    return gVvSites.contains(rva) ? false : orig;
-}
-
-template <int Which>
-static int splitCountDetour(void const* self) {
-    static constexpr char const* names[] = {"client getSplitScreenCount", "game getSplitScreenCount"};
-    int orig = reinterpret_cast<int (*)(void const*)>(gCfg[names[Which]].origin)(self);
-    if (Which == 1) orig = uint8_t(orig); // IMinecraftGame's returns one byte
-    auto                       rva = callerRva(_ReturnAddress());
-    std::lock_guard            lock(gVvLock);
-    static std::set<uintptr_t> seen;
-    if (seen.insert(rva).second) note("{} called from {:X} ({}): game said {}", names[Which], rva, rva, orig);
-    return gVvCountSites.contains(rva) ? 1 : orig;
-}
-
-// Inline hooks on the functions themselves: the game also calls them directly, past the vtable.
-static void hookSplitQueries(IClientInstance& client, IMinecraftGame& game) {
-    auto inlineHook = [](ll::memory::FuncPtr* slot, ll::memory::FuncPtr detour, char const* name) {
-        if (!slot) return;
-        ll::memory::hook(*slot, detour, &gCfg[name].origin, ll::memory::HookPriority::Normal);
-        note("Hooked {} inline at rva {:X}", name, reinterpret_cast<uintptr_t>(*slot) - gameBase());
-    };
-    inlineHook(findSlot(&client, &IClientInstance::isSplitScreenActive, "isSplitScreenActive"), fn(&splitActiveDetour),
-               "isSplitScreenActive");
-    inlineHook(findSlot(&client, &IClientInstance::getSplitScreenCount, "getSplitScreenCount"), fn(&splitCountDetour<0>),
-               "client getSplitScreenCount");
-    inlineHook(findSlot(&game, &IMinecraftGame::getSplitScreenCount, "getSplitScreenCount"), fn(&splitCountDetour<1>),
-               "game getSplitScreenCount");
-}
-
-// The third part of isVibrantVisualsEnabledAndSupported asks a global service (its ServiceLocator slot is at this
-// address in game 1.26.60.05) through vtable slot 0x230, and that answer turns false in split screen. Hook the function
-// behind the slot to log its answers; while gForceService is set ("vvsvc 0" / "vvsvc 1") it answers yes.
-static constexpr uintptr_t kVvServiceSlot = 0x128C3048;
-static std::atomic_bool    gForceService  = true;
-
-static bool vvServiceDetour(void* self) {
-    bool orig = reinterpret_cast<bool (*)(void*)>(gCfg["vvService"].origin)(self);
-    bool res  = orig || gForceService;
-    auto rva  = callerRva(_ReturnAddress());
-    std::lock_guard                              lock(gVvLock);
-    static std::set<std::pair<uintptr_t, bool>> seen; // logged again when a caller's answer changes
-    if (seen.insert({rva, orig}).second)
-        note("vv service check called from {:X} ({}): game said {}, returning {}", rva, rva, orig, res);
-    return res;
-}
-
-static void hookVvService() {
-    auto mod   = gameBase();
-    auto nt    = reinterpret_cast<IMAGE_NT_HEADERS const*>(mod + reinterpret_cast<IMAGE_DOS_HEADER const*>(mod)->e_lfanew);
-    auto end   = mod + nt->OptionalHeader.SizeOfImage;
-    auto svc   = *reinterpret_cast<void* const*>(mod + kVvServiceSlot);
-    if (!svc) return note("vv service: slot is empty");
-    auto vt = *reinterpret_cast<uintptr_t const* const*>(svc);
-    if (reinterpret_cast<uintptr_t>(vt) < mod || reinterpret_cast<uintptr_t>(vt) >= end)
-        return note("vv service: vtable outside the game, not hooking");
-    auto target = vt[0x230 / 8];
-    if (target < mod || target >= end) return note("vv service: slot 0x230 outside the game, not hooking");
-    ll::memory::hook(reinterpret_cast<ll::memory::FuncPtr>(target), fn(&vvServiceDetour), &gCfg["vvService"].origin,
-                     ll::memory::HookPriority::Normal);
-    note("Hooked vv service check inline at rva {:X} (vtable rva {:X})", target - mod, reinterpret_cast<uintptr_t>(vt) - mod);
-}
-
-static void hookVibrant(IOptionRegistry& options) {
-    hookSlot(&options, &IOptionRegistry::setForceVibrantVisualsDisabled, fn(&setForceVibrantDetour),
-             "setForceVibrantVisualsDisabled");
-    hookSlot(&options, &IOptionRegistry::isVibrantVisualsEnabledAndSupported, fn(&vibrantSupportedDetour),
-             "isVibrantVisualsEnabledAndSupported");
-    note("Vibrant Visuals: user enabled {}, enabled and supported {}, keep in split screen {}",
-         options.isVibrantVisualsUserEnabled(), options.isVibrantVisualsEnabledAndSupported(), gKeepVibrant.load());
-}
-
 // Test trigger, so a second player can be added without a second physical controller or cheats:
 // write "join <controller>" or "pads" lines into trigger.txt next to the mod; it is run on the client thread and deleted.
 static void offerPicker(SubClientId owner, bool fresh);
 static std::set<int> gNoMenuFor; // sub ids that just joined through the menu itself (client thread only)
 static thread_local bool tOurJoin = false; // joins the mod makes itself go through unchanged
 static GameControllerHandler_GameCore* controllerHandler();
+
+// A seat that was just left is still being taken down by the game for a few seconds; a new player joining it then is
+// dropped and can take the whole world down. A controller that presses start in that time joins once it has settled.
+static constexpr auto                       kSeatSettle = std::chrono::seconds(8);
+static std::chrono::steady_clock::time_point gLastLeave{};
+static std::mutex                           gWaitingLock;
+static std::set<int>                        gWaitingToJoin; // controllers waiting for a settled seat
+static void                                 joinRequestDetour(void* self, int controllerId);
 
 // Pops the top screen of a scene stack only when it is `name`. The game's schedulePopScreenWithExpectedNames pops
 // whatever is on top: it took player 1's toast screen, and with it every toast, the "Join as Player" prompt too.
@@ -409,20 +300,6 @@ static void runTrigger(std::string const& cmd, int arg) {
     if (!client) return note("trigger {}: no client instance", cmd);
     auto& game = client->getMinecraftGame();
     if (cmd == "pads") dumpPlayers(game); // the same as F9
-    if (cmd == "vvkeep") note("keep Vibrant Visuals in split screen: {}", gKeepVibrant = arg != 0);
-    if (cmd == "vvsvc") note("vv service check forced to yes: {}", gForceService = arg != 0);
-    if (cmd == "vv") {
-        std::lock_guard lock(gVvLock);
-        if (arg) gVvSites.insert(uintptr_t(arg));
-        else gVvSites.clear();
-        note("vv: {} caller(s) see no split screen", gVvSites.size());
-    }
-    if (cmd == "vvc") {
-        std::lock_guard lock(gVvLock);
-        if (arg) gVvCountSites.insert(uintptr_t(arg));
-        else gVvCountSites.clear();
-        note("vvc: {} caller(s) see one screen", gVvCountSites.size());
-    }
     if (cmd == "join") {
         note("adding player on controller {}", arg);
         game.addSubClientInstanceAndAssociateToUser(arg); // goes through the menu like the game's join prompt
@@ -838,7 +715,6 @@ static void pollTrigger() {
     static int tick   = 0;
     auto       client = ll::service::getClientInstance();
     gInWorld          = client && ll::service::getLevel();
-    if (client) gLocalPlayers = int(client->getMinecraftGame().getClientInstanceMap().size());
     auto       window = GetForegroundWindow();
     DWORD      pid    = 0;
     GetWindowThreadProcessId(window, &pid);
@@ -851,6 +727,24 @@ static void pollTrigger() {
         auto it      = clients.find(SubClientId(sub));
         return it != clients.end() && it->second && it->second->getTopScreenName().find("hud_screen") != std::string::npos;
     };
+    {
+        static size_t lastCount = 0;
+        size_t        count     = client ? client->getMinecraftGame().getClientInstanceMap().size() : 0;
+        if (count < lastCount) gLastLeave = std::chrono::steady_clock::now();
+        lastCount = count;
+        int waiting = -1;
+        if (client && gInWorld && gFreshSub < 0 && std::chrono::steady_clock::now() - gLastLeave >= kSeatSettle) {
+            std::lock_guard lock(gWaitingLock);
+            if (!gWaitingToJoin.empty()) {
+                waiting = *gWaitingToJoin.begin();
+                gWaitingToJoin.erase(gWaitingToJoin.begin());
+            }
+        }
+        if (waiting >= 0) {
+            note("controller {} joins now that the last seat has settled", waiting);
+            joinRequestDetour(&client->getMinecraftGame(), waiting);
+        }
+    }
     static bool askedFirst = false; // once per world
     if (!gInWorld) askedFirst = false;
     if (!askedFirst && worldTicks >= 60 && seesHud(0)) { // a controller already on player 1 asks who it is for
@@ -863,7 +757,8 @@ static void pollTrigger() {
             if (inputs.contains(0))
                 if (auto pads = gamepadsOf(inputs.at(0)); !pads.empty()) pad = pads.front();
         }
-        if (pad) freeFirstPad(client->getMinecraftGame(), pad);
+        // Player 1 keeps the controller it entered the world with; the pause menu's controller button can still free it.
+        if (pad) note("player 1 keeps its controller");
     }
     if (gFreshSub >= 0 && client) {
         static int hidden = -1; // the stand-in is hidden as soon as it is in the world
@@ -966,6 +861,7 @@ MyMod& MyMod::getInstance() {
 }
 
 static std::atomic_bool      gPlatformHooked = false;
+static auto fn(auto f) { return reinterpret_cast<ll::memory::FuncPtr>(f); }
 
 // Gamepads are sorted into players when they connect, which happens before enable(), so hook as early as possible.
 // While AppPlatform is being constructed its vtable pointer still moves from base to derived class, so re-hook
@@ -1629,7 +1525,10 @@ static void offerPicker(SubClientId owner, bool fresh) {
             tell(choice.sub, tr("splitscreen.tell.youAreNow", {localName(game.getClientInstanceMap(), int(choice.sub))}));
             if (fresh) { // the player made for this controller is not needed any more
                 auto now = game.getClientInstanceMap();
-                if (now.contains(owner)) now.at(owner)->requestLeaveGameAsync();
+                if (now.contains(owner)) {
+                    now.at(owner)->requestLeaveGameAsync();
+                    gLastLeave = std::chrono::steady_clock::now();
+                }
             }
             break;
         case Kind::Offline:
@@ -1706,6 +1605,18 @@ static void joinRequestDetour(void* self, int controllerId) {
         return;
     }
     if (gFreshSub >= 0) return; // someone is joining already
+    if (std::chrono::steady_clock::now() - gLastLeave < kSeatSettle) {
+        bool fresh;
+        {
+            std::lock_guard lock(gWaitingLock);
+            fresh = gWaitingToJoin.insert(controllerId).second;
+        }
+        if (fresh) {
+            note("controller {} waits to join: a player just left", controllerId);
+            tell(SubClientId::PrimaryClient, "Player joining in a few seconds...");
+        }
+        return;
+    }
     if (everyonePaused()) { // a player cannot join a stopped world (the game hangs): join once it runs again
         note("controller {} asked to join while the world is paused: joining when it runs again", controllerId);
         gAskLater.insert(controllerId);
@@ -1869,9 +1780,6 @@ bool MyMod::enable() {
     }
     hookSlot(&game, &IMinecraftGame::addSubClientInstanceAndAssociateToUser, fn(&joinRequestDetour),
              "addSubClientInstanceAndAssociateToUser");
-    hookVibrant(client->getOptions());
-    hookSplitQueries(*client.as_ptr(), game);
-    hookVvService();
     ll::thread::ClientThreadExecutor::getDefault().execute(pollTrigger);
     note("SplitScreenMod enabled ({} hooks)", gHooks.size());
     return true;
