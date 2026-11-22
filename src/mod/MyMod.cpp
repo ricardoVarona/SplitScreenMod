@@ -272,6 +272,47 @@ static ll::memory::FuncPtr* hookSlot(void* object, F method, ll::memory::FuncPtr
     return slot;
 }
 
+static auto fn(auto f) { return reinterpret_cast<ll::memory::FuncPtr>(f); }
+// Vibrant Visuals in split screen (experiment). The game turns Vibrant Visuals off once a second local player joins.
+// These hooks log what the game asks the options for, and while gKeepVibrant is set they keep it on: a request to
+// force it off is turned into "off = false", and "enabled and supported" stays true if it was true with one player.
+// "vv 0" / "vv 1" in trigger.txt turns this off / on while the game runs.
+static std::atomic_bool gKeepVibrant  = true;
+static std::atomic_int  gLocalPlayers = 1;     // refreshed on the client thread
+static std::atomic_bool gVibrantSolo  = false; // what the game said while only one player was in
+
+static uintptr_t callerRva(void* ret) { return reinterpret_cast<uintptr_t>(ret) - gameBase(); }
+
+static void setForceVibrantDetour(void* self, bool value) {
+    auto orig = reinterpret_cast<void (*)(void*, bool)>(gCfg["setForceVibrantVisualsDisabled"].origin);
+    bool pass = value && !gKeepVibrant;
+    note("setForceVibrantVisualsDisabled({}) from {:X} with {} players: passing {}", value, callerRva(_ReturnAddress()),
+         gLocalPlayers.load(), pass);
+    orig(self, pass);
+}
+
+static bool vibrantSupportedDetour(void const* self) {
+    auto orig = reinterpret_cast<bool (*)(void const*)>(gCfg["isVibrantVisualsEnabledAndSupported"].origin);
+    bool said = orig(self);
+    int  players = gLocalPlayers.load();
+    if (players <= 1) gVibrantSolo = said;
+    bool res = said || (gKeepVibrant && players > 1 && gVibrantSolo);
+    static std::atomic_int last = -1; // log only when the answer changes
+    if (last.exchange(int(said) * 2 + int(res)) != int(said) * 2 + int(res))
+        note("isVibrantVisualsEnabledAndSupported from {:X} with {} players: game said {}, returning {}",
+             callerRva(_ReturnAddress()), players, said, res);
+    return res;
+}
+
+static void hookVibrant(IOptionRegistry& options) {
+    hookSlot(&options, &IOptionRegistry::setForceVibrantVisualsDisabled, fn(&setForceVibrantDetour),
+             "setForceVibrantVisualsDisabled");
+    hookSlot(&options, &IOptionRegistry::isVibrantVisualsEnabledAndSupported, fn(&vibrantSupportedDetour),
+             "isVibrantVisualsEnabledAndSupported");
+    note("Vibrant Visuals: user enabled {}, enabled and supported {}, keep in split screen {}",
+         options.isVibrantVisualsUserEnabled(), options.isVibrantVisualsEnabledAndSupported(), gKeepVibrant.load());
+}
+
 // Test trigger, so a second player can be added without a second physical controller or cheats:
 // write "join <controller>" or "pads" lines into trigger.txt next to the mod; it is run on the client thread and deleted.
 static void offerPicker(SubClientId owner, bool fresh);
@@ -292,6 +333,7 @@ static void runTrigger(std::string const& cmd, int arg) {
     if (!client) return note("trigger {}: no client instance", cmd);
     auto& game = client->getMinecraftGame();
     if (cmd == "pads") dumpPlayers(game); // the same as F9
+    if (cmd == "vv") note("keep Vibrant Visuals in split screen: {}", gKeepVibrant = arg != 0);
     if (cmd == "join") {
         note("adding player on controller {}", arg);
         game.addSubClientInstanceAndAssociateToUser(arg); // goes through the menu like the game's join prompt
@@ -707,6 +749,7 @@ static void pollTrigger() {
     static int tick   = 0;
     auto       client = ll::service::getClientInstance();
     gInWorld          = client && ll::service::getLevel();
+    if (client) gLocalPlayers = int(client->getMinecraftGame().getClientInstanceMap().size());
     auto       window = GetForegroundWindow();
     DWORD      pid    = 0;
     GetWindowThreadProcessId(window, &pid);
@@ -834,7 +877,6 @@ MyMod& MyMod::getInstance() {
 }
 
 static std::atomic_bool      gPlatformHooked = false;
-static auto fn(auto f) { return reinterpret_cast<ll::memory::FuncPtr>(f); }
 
 // Gamepads are sorted into players when they connect, which happens before enable(), so hook as early as possible.
 // While AppPlatform is being constructed its vtable pointer still moves from base to derived class, so re-hook
@@ -1738,6 +1780,7 @@ bool MyMod::enable() {
     }
     hookSlot(&game, &IMinecraftGame::addSubClientInstanceAndAssociateToUser, fn(&joinRequestDetour),
              "addSubClientInstanceAndAssociateToUser");
+    hookVibrant(client->getOptions());
     ll::thread::ClientThreadExecutor::getDefault().execute(pollTrigger);
     note("SplitScreenMod enabled ({} hooks)", gHooks.size());
     return true;
