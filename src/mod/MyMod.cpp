@@ -276,7 +276,7 @@ static auto fn(auto f) { return reinterpret_cast<ll::memory::FuncPtr>(f); }
 // Vibrant Visuals in split screen (experiment). The game turns Vibrant Visuals off once a second local player joins.
 // These hooks log what the game asks the options for, and while gKeepVibrant is set they keep it on: a request to
 // force it off is turned into "off = false", and "enabled and supported" stays true if it was true with one player.
-// "vv 0" / "vv 1" in trigger.txt turns this off / on while the game runs.
+// "vvkeep 0" / "vvkeep 1" in trigger.txt turns this off / on while the game runs.
 static std::atomic_bool gKeepVibrant  = true;
 static std::atomic_int  gLocalPlayers = 1;     // refreshed on the client thread
 static std::atomic_bool gVibrantSolo  = false; // what the game said while only one player was in
@@ -302,6 +302,49 @@ static bool vibrantSupportedDetour(void const* self) {
         note("isVibrantVisualsEnabledAndSupported from {:X} with {} players: game said {}, returning {}",
              callerRva(_ReturnAddress()), players, said, res);
     return res;
+}
+
+// Which callers of the split screen checks turn Vibrant Visuals off (ported from the exp/vv experiment). Every new
+// caller is logged with its address in hex and decimal; "vv <decimal>" in trigger.txt makes that caller see
+// "not split", "vvc <decimal>" makes it see one screen, and 0 clears the list.
+static std::mutex          gVvLock;
+static std::set<uintptr_t> gVvSites;
+static std::set<uintptr_t> gVvCountSites;
+
+static bool splitActiveDetour(void const* self) {
+    auto orig = reinterpret_cast<bool (*)(void const*)>(gCfg["isSplitScreenActive"].origin)(self);
+    auto rva  = callerRva(_ReturnAddress());
+    std::lock_guard            lock(gVvLock);
+    static std::set<uintptr_t> seen;
+    if (seen.insert(rva).second) note("isSplitScreenActive called from {:X} ({}): game said {}", rva, rva, orig);
+    return gVvSites.contains(rva) ? false : orig;
+}
+
+template <int Which>
+static int splitCountDetour(void const* self) {
+    static constexpr char const* names[] = {"client getSplitScreenCount", "game getSplitScreenCount"};
+    int orig = reinterpret_cast<int (*)(void const*)>(gCfg[names[Which]].origin)(self);
+    if (Which == 1) orig = uint8_t(orig); // IMinecraftGame's returns one byte
+    auto                       rva = callerRva(_ReturnAddress());
+    std::lock_guard            lock(gVvLock);
+    static std::set<uintptr_t> seen;
+    if (seen.insert(rva).second) note("{} called from {:X} ({}): game said {}", names[Which], rva, rva, orig);
+    return gVvCountSites.contains(rva) ? 1 : orig;
+}
+
+// Inline hooks on the functions themselves: the game also calls them directly, past the vtable.
+static void hookSplitQueries(IClientInstance& client, IMinecraftGame& game) {
+    auto inlineHook = [](ll::memory::FuncPtr* slot, ll::memory::FuncPtr detour, char const* name) {
+        if (!slot) return;
+        ll::memory::hook(*slot, detour, &gCfg[name].origin, ll::memory::HookPriority::Normal);
+        note("Hooked {} inline at rva {:X}", name, reinterpret_cast<uintptr_t>(*slot) - gameBase());
+    };
+    inlineHook(findSlot(&client, &IClientInstance::isSplitScreenActive, "isSplitScreenActive"), fn(&splitActiveDetour),
+               "isSplitScreenActive");
+    inlineHook(findSlot(&client, &IClientInstance::getSplitScreenCount, "getSplitScreenCount"), fn(&splitCountDetour<0>),
+               "client getSplitScreenCount");
+    inlineHook(findSlot(&game, &IMinecraftGame::getSplitScreenCount, "getSplitScreenCount"), fn(&splitCountDetour<1>),
+               "game getSplitScreenCount");
 }
 
 static void hookVibrant(IOptionRegistry& options) {
@@ -333,7 +376,19 @@ static void runTrigger(std::string const& cmd, int arg) {
     if (!client) return note("trigger {}: no client instance", cmd);
     auto& game = client->getMinecraftGame();
     if (cmd == "pads") dumpPlayers(game); // the same as F9
-    if (cmd == "vv") note("keep Vibrant Visuals in split screen: {}", gKeepVibrant = arg != 0);
+    if (cmd == "vvkeep") note("keep Vibrant Visuals in split screen: {}", gKeepVibrant = arg != 0);
+    if (cmd == "vv") {
+        std::lock_guard lock(gVvLock);
+        if (arg) gVvSites.insert(uintptr_t(arg));
+        else gVvSites.clear();
+        note("vv: {} caller(s) see no split screen", gVvSites.size());
+    }
+    if (cmd == "vvc") {
+        std::lock_guard lock(gVvLock);
+        if (arg) gVvCountSites.insert(uintptr_t(arg));
+        else gVvCountSites.clear();
+        note("vvc: {} caller(s) see one screen", gVvCountSites.size());
+    }
     if (cmd == "join") {
         note("adding player on controller {}", arg);
         game.addSubClientInstanceAndAssociateToUser(arg); // goes through the menu like the game's join prompt
@@ -1781,6 +1836,7 @@ bool MyMod::enable() {
     hookSlot(&game, &IMinecraftGame::addSubClientInstanceAndAssociateToUser, fn(&joinRequestDetour),
              "addSubClientInstanceAndAssociateToUser");
     hookVibrant(client->getOptions());
+    hookSplitQueries(*client.as_ptr(), game);
     ll::thread::ClientThreadExecutor::getDefault().execute(pollTrigger);
     note("SplitScreenMod enabled ({} hooks)", gHooks.size());
     return true;
