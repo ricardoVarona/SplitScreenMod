@@ -5,7 +5,7 @@ on:
   
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022 # windows-latest ships MSVC 14.52, which needs Clang 22 and breaks LeviLamina
     strategy:
       matrix:
         target_type:
@@ -25,7 +25,12 @@ jobs:
           restore-keys: |
             xmake-
 
-      # The runner's preinstalled LLVM is used; installing LLVM 22 every run took over a minute.
+      # The runner's LLVM is too old for the MSVC STL, so install LLVM 22.
+      - name: Setup LLVM
+        uses: ZhongRuoyu/setup-llvm@v0
+        with:
+          llvm-version: 22
+
       - run: clang-cl --version
 
       - run: |
